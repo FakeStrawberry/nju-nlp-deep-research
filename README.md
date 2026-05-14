@@ -131,6 +131,48 @@ http://127.0.0.1:8000/v1
 6. 在 `hard50` 或开发集上调试
 7. 导出统一格式结果
 
+## 6.1 已补充的基础实现
+
+本仓库已经新增一个可直接运行的多轮 agent 脚本：
+
+- `agent/deep_research_agent.py`
+  - 支持 `search` / `open_doc` / `find_in_doc` 三个本地工具
+  - 支持多轮工具调用 loop
+  - 支持最大轮数、无新信息停止、强制最终回答
+  - 支持上下文压缩：保留完整提交轨迹，同时给模型侧传入紧凑状态摘要
+  - 直接导出符合要求的 `submission.jsonl`
+
+在已经启动 vLLM、并已经构建 BM25 索引后，可以运行：
+
+要求 Python 3.10 或更高版本。
+
+```bash
+python -m agent.deep_research_agent \
+  --dataset browsecomp_plus_hard50.jsonl \
+  --index-path indexes/browsecomp_plus_bm25.sqlite \
+  --output runs/submission.jsonl \
+  --model qwen_auto \
+  --base-url http://127.0.0.1:8000/v1 \
+  --top-k 8 \
+  --max-rounds 6
+```
+
+如果中途中断，可以用 `--resume` 继续写同一个输出文件：
+
+```bash
+python -m agent.deep_research_agent \
+  --dataset browsecomp_plus_hard50.jsonl \
+  --index-path indexes/browsecomp_plus_bm25.sqlite \
+  --output runs/submission.jsonl \
+  --model qwen_auto \
+  --base-url http://127.0.0.1:8000/v1 \
+  --top-k 8 \
+  --max-rounds 6 \
+  --resume
+```
+
+华为云上的完整操作流程见 [HUAWEI_CLOUD_RUNBOOK.md](HUAWEI_CLOUD_RUNBOOK.md)。
+
 ## 7. 实验要求
 
 ### 6.1 必做内容

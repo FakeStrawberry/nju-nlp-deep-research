@@ -58,6 +58,42 @@ python -m agent.build_bm25_index \
 
 之后 notebook 只需要复用 `index_path`。
 
+## 多轮 Deep Research Agent 脚本
+
+基础任务实现放在 [deep_research_agent.py](deep_research_agent.py)。
+
+它做的事情：
+
+- 用 `search` / `open_doc` / `find_in_doc` 执行本地检索与文档检查
+- 让模型在多轮 loop 中决定是否继续搜索或最终回答
+- 用最大轮数与“无新信息”作为停止条件
+- 保留完整 `messages` 轨迹，并额外记录 `state_summary`
+- 直接写出评测脚本可读取的 JSONL
+
+示例：
+
+```bash
+python -m agent.deep_research_agent \
+  --dataset browsecomp_plus_hard50.jsonl \
+  --index-path indexes/browsecomp_plus_bm25.sqlite \
+  --output runs/submission.jsonl \
+  --model qwen_auto \
+  --base-url http://127.0.0.1:8000/v1 \
+  --top-k 8 \
+  --max-rounds 6
+```
+
+调试时可以先只跑 3 条：
+
+```bash
+python -m agent.deep_research_agent \
+  --dataset browsecomp_plus_hard50.jsonl \
+  --index-path indexes/browsecomp_plus_bm25.sqlite \
+  --output runs/debug_submission.jsonl \
+  --model qwen_auto \
+  --limit 3
+```
+
 ## 依赖
 
 ```bash
