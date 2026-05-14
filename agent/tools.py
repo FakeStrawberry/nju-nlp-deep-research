@@ -4,8 +4,146 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .browsecomp_searcher import BrowseCompBM25Searcher, snippetize
 
 
+QUERY_SNIPPET_STOPWORDS = {
+    "about",
+    "after",
+    "again",
+    "also",
+    "answer",
+    "another",
+    "because",
+    "before",
+    "being",
+    "between",
+    "could",
+    "during",
+    "first",
+    "following",
+    "given",
+    "identify",
+    "including",
+    "later",
+    "mentioned",
+    "other",
+    "question",
+    "second",
+    "should",
+    "something",
+    "their",
+    "there",
+    "these",
+    "third",
+    "those",
+    "through",
+    "under",
+    "which",
+    "while",
+    "would",
+}
+
+
 def build_searcher(index_path: str) -> BrowseCompBM25Searcher:
     return BrowseCompBM25Searcher(index_path=index_path)
+
+
+def _query_terms(query: str) -> List[str]:
+    terms: List[str] = []
+    for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", query.lower()):
+        token = token.strip("'’")
+        if token.endswith(("'s", "’s")):
+            token = token[:-2]
+        if not token:
+            continue
+        if token in QUERY_SNIPPET_STOPWORDS:
+            continue
+        if any(ch.isdigit() for ch in token) or len(token) >= 4:
+            if token not in terms:
+                terms.append(token)
+    return terms
+
+
+def _document_lead(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    frontmatter_end = text.find("\n---", 4) if text.startswith("---\n") else -1
+    if frontmatter_end != -1:
+        next_break = text.find("\n\n", frontmatter_end + 4)
+        end = next_break if next_break != -1 else frontmatter_end + 4
+        return snippetize(text[:end].strip(), max_chars)
+    first_break = text.find("\n\n")
+    if first_break != -1 and first_break < max_chars:
+        return text[:first_break].strip()
+    return snippetize(text, max_chars)
+
+
+def _slice_around(text: str, center: int, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    start = max(0, center - max_chars // 2)
+    end = min(len(text), start + max_chars)
+    start = max(0, end - max_chars)
+
+    if start > 0:
+        whitespace = text.find(" ", start, min(end, start + 80))
+        if whitespace != -1:
+            start = whitespace + 1
+    if end < len(text):
+        whitespace = text.rfind(" ", max(start, end - 80), end)
+        if whitespace != -1:
+            end = whitespace
+
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(text) else ""
+    return prefix + text[start:end].strip() + suffix
+
+
+def query_aware_snippet(text: str, query: str, max_chars: int = 1200) -> str:
+    if not max_chars or max_chars <= 0 or len(text) <= max_chars:
+        return text
+
+    terms = _query_terms(query)
+    if not terms:
+        return snippetize(text, max_chars)
+
+    lower_text = text.lower()
+    candidates: List[int] = []
+    for term in terms[:20]:
+        start = 0
+        seen = 0
+        while seen < 8:
+            pos = lower_text.find(term, start)
+            if pos == -1:
+                break
+            candidates.append(pos + len(term) // 2)
+            start = pos + len(term)
+            seen += 1
+
+    if not candidates:
+        return snippetize(text, max_chars)
+
+    window = max(500, max_chars)
+    best_center = candidates[0]
+    best_score = -1
+    for center in candidates:
+        start = max(0, center - window // 2)
+        end = min(len(text), center + window // 2)
+        chunk = lower_text[start:end]
+        score = 0
+        for term in terms:
+            if term in chunk:
+                score += 3 if any(ch.isdigit() for ch in term) else 1
+        if score > best_score:
+            best_score = score
+            best_center = center
+
+    lead_budget = min(360, max_chars // 3)
+    lead = _document_lead(text, lead_budget)
+    if lead and best_center > len(lead) + 200 and max_chars >= 700:
+        passage_budget = max_chars - len(lead) - 8
+        passage = _slice_around(text, best_center, passage_budget)
+        return f"{lead.rstrip()}\n...\n{passage}"
+
+    return _slice_around(text, best_center, max_chars)
 
 
 def retrieve_once(
@@ -19,7 +157,7 @@ def retrieve_once(
         {
             "docid": doc["docid"],
             "score": doc["score"],
-            "snippet": snippetize(doc["text"], snippet_max_chars),
+            "snippet": query_aware_snippet(doc["text"], query=query, max_chars=snippet_max_chars),
             "url": doc.get("url", ""),
         }
         for doc in docs
