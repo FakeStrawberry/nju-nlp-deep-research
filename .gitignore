@@ -1,0 +1,9 @@
+Qwen3-8B/
+# Python 环境
+.venv/
+__pycache__/
+
+# Jupyter 缓存
+.ipynb_checkpoints/
+indexes/
+kernel_meta/
