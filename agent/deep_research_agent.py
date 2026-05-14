@@ -49,6 +49,8 @@ Evidence: <docid list or short citations>
 
 
 SPECIAL_TOKEN_RE = re.compile(r"\[unused\d+\]\s*")
+THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.IGNORECASE | re.DOTALL)
+THINK_TAG_RE = re.compile(r"</?think>", flags=re.IGNORECASE)
 EXACT_ANSWER_RE = re.compile(
     r"(?:Exact Answer|Final Answer|Answer)\s*:\s*(.+?)(?:\n[A-Z][A-Za-z ]{1,30}\s*:|\Z)",
     flags=re.IGNORECASE | re.DOTALL,
@@ -58,7 +60,14 @@ EXACT_ANSWER_RE = re.compile(
 def clean_model_text(text: Any) -> str:
     if text is None:
         return ""
-    return SPECIAL_TOKEN_RE.sub("", str(text)).strip()
+    cleaned = SPECIAL_TOKEN_RE.sub("", str(text))
+    cleaned = THINK_BLOCK_RE.sub("", cleaned)
+    cleaned = THINK_TAG_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+def has_exact_answer(text: str) -> bool:
+    return bool(EXACT_ANSWER_RE.search(clean_model_text(text)))
 
 
 def extract_exact_answer(text: str) -> str:
@@ -83,6 +92,41 @@ def truncate_text(text: str, max_chars: int) -> str:
     if max_chars <= 0 or len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "..."
+
+
+def is_plausible_short_answer(answer: str) -> bool:
+    answer = clean_model_text(answer)
+    if not answer:
+        return False
+    if len(answer) > 160:
+        return False
+    bad_markers = (
+        "wait,",
+        "i'm not sure",
+        "not sure",
+        "maybe",
+        "perhaps",
+        "the information is not available",
+        "unable to identify",
+    )
+    lowered = answer.lower()
+    return not any(marker in lowered for marker in bad_markers)
+
+
+def extract_json_array(text: str) -> Optional[List[Any]]:
+    cleaned = clean_model_text(text)
+    start = cleaned.find("[")
+    while start != -1:
+        decoder = json.JSONDecoder()
+        try:
+            parsed, _ = decoder.raw_decode(cleaned[start:])
+        except json.JSONDecodeError:
+            start = cleaned.find("[", start + 1)
+            continue
+        if isinstance(parsed, list):
+            return parsed
+        start = cleaned.find("[", start + 1)
+    return None
 
 
 def parse_json_object(value: Any) -> Dict[str, Any]:
@@ -234,9 +278,12 @@ class DeepResearchAgent:
         max_tokens: int = 1024,
         temperature: float = 0.0,
         max_history_messages: int = 18,
-        max_tool_result_chars: int = 7000,
+        max_tool_result_chars: int = 0,
         top_k: int = 5,
         bootstrap_search: bool = True,
+        bootstrap_query_count: int = 4,
+        auto_open_top_n: int = 1,
+        min_tool_calls: int = 3,
         max_no_new_info_rounds: int = 2,
     ) -> None:
         self.client = client
@@ -250,6 +297,9 @@ class DeepResearchAgent:
         self.max_tool_result_chars = max_tool_result_chars
         self.top_k = top_k
         self.bootstrap_search = bootstrap_search
+        self.bootstrap_query_count = bootstrap_query_count
+        self.auto_open_top_n = auto_open_top_n
+        self.min_tool_calls = min_tool_calls
         self.max_no_new_info_rounds = max_no_new_info_rounds
 
     def answer(self, question: str, query_id: Optional[str] = None) -> Dict[str, Any]:
@@ -279,6 +329,19 @@ class DeepResearchAgent:
 
                 if not tool_calls:
                     final_text = assistant_message.get("content", "")
+                    if state.tool_call_count < self.min_tool_calls:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Continue researching before answering. You have not used enough evidence yet. "
+                                    "Use search/open_doc/find_in_doc to verify at least one concrete clue, then answer."
+                                ),
+                            }
+                        )
+                        continue
+                    if not has_exact_answer(final_text) or not is_plausible_short_answer(extract_exact_answer(final_text)):
+                        final_text = self._force_final_answer(messages, state)
                     return self._build_record(
                         query_id=query_id,
                         question=question,
@@ -298,13 +361,9 @@ class DeepResearchAgent:
                     args = parse_json_object(tool_call.get("function", {}).get("arguments", "{}"))
                     if state.remember_tool_result(tool_name, args, result):
                         round_has_new_info = True
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "content": truncate_text(json_dumps(result), self.max_tool_result_chars),
-                        }
-                    )
+                    self._append_tool_result(messages, tool_call["id"], result)
+                    if tool_name == "search":
+                        self._append_auto_open_calls(messages, state, result, prefix=f"round{round_id}")
 
                 if round_has_new_info:
                     state.no_new_info_rounds = 0
@@ -341,21 +400,156 @@ class DeepResearchAgent:
             )
 
     def _append_bootstrap_search(self, messages: List[Dict[str, Any]], state: ResearchState, question: str) -> None:
+        queries = self._build_initial_queries(question)
+        for index, query in enumerate(queries, start=1):
+            self._append_search_call(messages, state, query=query, call_id=f"bootstrap_search_{index}")
+
+    def _build_initial_queries(self, question: str) -> List[str]:
+        queries: List[str] = []
+        for query in self._llm_search_plan(question):
+            self._add_query(queries, query)
+        for query in self._heuristic_search_queries(question):
+            self._add_query(queries, query)
+        self._add_query(queries, question)
+        return queries[: max(1, self.bootstrap_query_count)]
+
+    def _llm_search_plan(self, question: str) -> List[str]:
+        prompt = (
+            "Create concise search queries for a local BM25 corpus. "
+            "Use only entities, dates, quoted phrases, and distinctive clues from the question. "
+            "Do not answer the question. Return only a JSON array of strings, no markdown.\n\n"
+            f"Question:\n{question}"
+        )
+        try:
+            response = self.client.simple_chat(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You write high-recall BM25 search queries."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=384,
+            )
+        except Exception:
+            return []
+
+        content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+        parsed = extract_json_array(content)
+        if not parsed:
+            return []
+        return [str(item).strip() for item in parsed if isinstance(item, str) and item.strip()]
+
+    def _heuristic_search_queries(self, question: str) -> List[str]:
+        queries: List[str] = []
+        quoted = re.findall(r"[\"“”']([^\"“”']{2,80})[\"“”']", question)
+        for phrase in quoted:
+            self._add_query(queries, phrase)
+
+        sentences = re.split(r"(?<=[.!?])\s+", question)
+        for sentence in sentences:
+            words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", sentence)
+            distinctive = [
+                word.strip("'’")
+                for word in words
+                if len(word.strip("'’")) >= 5 or re.search(r"\d", word)
+            ]
+            if 3 <= len(distinctive) <= 14:
+                self._add_query(queries, " ".join(distinctive[:14]))
+
+        all_words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", question)
+        rareish = []
+        stop = {
+            "which",
+            "where",
+            "their",
+            "there",
+            "about",
+            "would",
+            "could",
+            "should",
+            "first",
+            "second",
+            "between",
+            "author",
+            "published",
+            "question",
+            "answer",
+        }
+        for word in all_words:
+            cleaned = word.strip("'’")
+            if len(cleaned) >= 7 and cleaned.lower() not in stop:
+                rareish.append(cleaned)
+        if rareish:
+            self._add_query(queries, " ".join(rareish[:12]))
+        return queries
+
+    @staticmethod
+    def _add_query(queries: List[str], query: str) -> None:
+        query = re.sub(r"\s+", " ", clean_model_text(query)).strip(" .;:")
+        if not query:
+            return
+        lowered = query.lower()
+        if lowered not in {existing.lower() for existing in queries}:
+            queries.append(query)
+
+    def _append_search_call(self, messages: List[Dict[str, Any]], state: ResearchState, query: str, call_id: str) -> None:
         tool_call = {
-            "id": "bootstrap_search_1",
+            "id": call_id,
             "type": "function",
             "function": {
                 "name": "search",
-                "arguments": json_dumps({"query": question, "top_k": self.top_k}),
+                "arguments": json_dumps({"query": query, "top_k": self.top_k}),
             },
         }
         messages.append({"role": "assistant", "content": "", "tool_calls": [tool_call]})
         result = self._execute_tool_call(tool_call)
-        state.remember_tool_result("search", {"query": question, "top_k": self.top_k}, result)
+        state.remember_tool_result("search", {"query": query, "top_k": self.top_k}, result)
+        self._append_tool_result(messages, tool_call["id"], result)
+        self._append_auto_open_calls(messages, state, result, prefix=call_id)
+
+    def _append_auto_open_calls(
+        self,
+        messages: List[Dict[str, Any]],
+        state: ResearchState,
+        search_result: Any,
+        prefix: str,
+    ) -> None:
+        if self.auto_open_top_n <= 0 or not isinstance(search_result, list):
+            return
+        tool_calls = []
+        for item in search_result:
+            if len(tool_calls) >= self.auto_open_top_n:
+                break
+            if not isinstance(item, dict):
+                continue
+            docid = str(item.get("docid", "")).strip()
+            if not docid or f"open_doc:{json_dumps({'docid': docid})}" in state.seen_actions:
+                continue
+            tool_call = {
+                "id": f"{prefix}_open_{len(tool_calls) + 1}",
+                "type": "function",
+                "function": {
+                    "name": "open_doc",
+                    "arguments": json_dumps({"docid": docid}),
+                },
+            }
+            tool_calls.append(tool_call)
+            state.seen_actions.add(canonical_action(tool_call))
+
+        if not tool_calls:
+            return
+        messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
+        for tool_call in tool_calls:
+            result = self._execute_tool_call(tool_call)
+            args = parse_json_object(tool_call.get("function", {}).get("arguments", "{}"))
+            state.remember_tool_result("open_doc", args, result)
+            self._append_tool_result(messages, tool_call["id"], result)
+
+    def _append_tool_result(self, messages: List[Dict[str, Any]], tool_call_id: str, result: Any) -> None:
         messages.append(
             {
                 "role": "tool",
-                "tool_call_id": tool_call["id"],
+                "tool_call_id": tool_call_id,
                 "content": truncate_text(json_dumps(result), self.max_tool_result_chars),
             }
         )
@@ -495,6 +689,9 @@ def run_submission(args: argparse.Namespace) -> None:
         max_tool_result_chars=args.max_tool_result_chars,
         top_k=args.top_k,
         bootstrap_search=args.bootstrap_search,
+        bootstrap_query_count=args.bootstrap_query_count,
+        auto_open_top_n=args.auto_open_top_n,
+        min_tool_calls=args.min_tool_calls,
         max_no_new_info_rounds=args.max_no_new_info_rounds,
     )
 
@@ -539,7 +736,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--find-window-chars", type=int, default=500, help="Context chars around find_in_doc matches.")
     parser.add_argument("--max-find-matches", type=int, default=5, help="Maximum find_in_doc matches returned.")
     parser.add_argument("--max-history-messages", type=int, default=18, help="Recent messages retained in model context.")
-    parser.add_argument("--max-tool-result-chars", type=int, default=7000, help="Max serialized chars per tool result.")
+    parser.add_argument(
+        "--max-tool-result-chars",
+        type=int,
+        default=0,
+        help="Max serialized chars per stored tool result. 0 keeps valid full JSON.",
+    )
+    parser.add_argument(
+        "--bootstrap-query-count",
+        type=int,
+        default=4,
+        help="Number of initial planned search queries before the free-form agent loop.",
+    )
+    parser.add_argument(
+        "--auto-open-top-n",
+        type=int,
+        default=1,
+        help="Automatically open this many top documents after each search.",
+    )
+    parser.add_argument(
+        "--min-tool-calls",
+        type=int,
+        default=3,
+        help="Do not accept a model final answer before this many tool calls.",
+    )
     parser.add_argument(
         "--max-no-new-info-rounds",
         type=int,

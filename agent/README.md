@@ -80,7 +80,10 @@ python -m agent.deep_research_agent \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
   --top-k 8 \
-  --max-rounds 6
+  --max-rounds 6 \
+  --bootstrap-query-count 4 \
+  --auto-open-top-n 1 \
+  --min-tool-calls 3
 ```
 
 调试时可以先只跑 3 条：

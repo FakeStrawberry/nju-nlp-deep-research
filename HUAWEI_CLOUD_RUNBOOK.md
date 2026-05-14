@@ -107,7 +107,10 @@ python -m agent.deep_research_agent \
   --base-url http://127.0.0.1:8000/v1 \
   --limit 3 \
   --top-k 8 \
-  --max-rounds 6
+  --max-rounds 6 \
+  --bootstrap-query-count 4 \
+  --auto-open-top-n 1 \
+  --min-tool-calls 3
 ```
 
 如果用 Pangu，把 `--model qwen_auto` 改成：
@@ -127,7 +130,10 @@ python -m agent.deep_research_agent \
   --base-url http://127.0.0.1:8000/v1 \
   --top-k 8 \
   --max-rounds 6 \
-  --max-tokens 1024
+  --max-tokens 1024 \
+  --bootstrap-query-count 4 \
+  --auto-open-top-n 1 \
+  --min-tool-calls 3
 ```
 
 如果运行中断，用下面命令续跑，会跳过已经写入 `runs/submission.jsonl` 的 `query_id`：
@@ -142,6 +148,9 @@ python -m agent.deep_research_agent \
   --top-k 8 \
   --max-rounds 6 \
   --max-tokens 1024 \
+  --bootstrap-query-count 4 \
+  --auto-open-top-n 1 \
+  --min-tool-calls 3 \
   --resume
 ```
 
