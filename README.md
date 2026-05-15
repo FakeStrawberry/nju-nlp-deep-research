@@ -150,14 +150,16 @@ http://127.0.0.1:8000/v1
 python -m agent.deep_research_agent \
   --dataset browsecomp_plus_hard50.jsonl \
   --index-path indexes/browsecomp_plus_bm25.sqlite \
-  --output runs/submission.jsonl \
+  --output runs/submission_v5.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
   --top-k 8 \
   --max-rounds 6 \
   --bootstrap-query-count 4 \
   --auto-open-top-n 1 \
-  --min-tool-calls 3
+  --min-tool-calls 3 \
+  --verification-top-k 5 \
+  --verification-open-top-n 1
 ```
 
 如果中途中断，可以用 `--resume` 继续写同一个输出文件：
@@ -166,7 +168,7 @@ python -m agent.deep_research_agent \
 python -m agent.deep_research_agent \
   --dataset browsecomp_plus_hard50.jsonl \
   --index-path indexes/browsecomp_plus_bm25.sqlite \
-  --output runs/submission.jsonl \
+  --output runs/submission_v5.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
   --top-k 8 \
@@ -174,6 +176,8 @@ python -m agent.deep_research_agent \
   --bootstrap-query-count 4 \
   --auto-open-top-n 1 \
   --min-tool-calls 3 \
+  --verification-top-k 5 \
+  --verification-open-top-n 1 \
   --resume
 ```
 

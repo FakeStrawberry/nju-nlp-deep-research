@@ -48,6 +48,26 @@ Evidence: <docid list or short citations>
 """
 
 
+VERIFIER_PROMPT = """Verify the candidate final answer before submission.
+
+Use only the existing conversation evidence and the verification search results just added.
+Do not use outside knowledge and do not invent missing evidence.
+
+Rules:
+- If the candidate is directly supported, keep it.
+- If the candidate is a ticker, abbreviation, or shorthand, normalize it to the full entity name when the evidence supports that normalization.
+- If another short answer is better supported by the evidence, replace the candidate with that answer.
+- Use "Insufficient evidence" only when no specific answer is supported by the evidence.
+- Keep Exact Answer short: a name, title, organization, number, date, country, or phrase.
+
+Use exactly this format:
+Explanation: <brief evidence-based verification>
+Exact Answer: <short final answer only>
+Confidence: <0-100>%
+Evidence: <docid list or short citations>
+"""
+
+
 SPECIAL_TOKEN_RE = re.compile(r"\[unused\d+\]\s*")
 THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.IGNORECASE | re.DOTALL)
 THINK_TAG_RE = re.compile(r"</?think>", flags=re.IGNORECASE)
@@ -111,6 +131,19 @@ def is_plausible_short_answer(answer: str) -> bool:
     )
     lowered = answer.lower()
     return not any(marker in lowered for marker in bad_markers)
+
+
+def is_insufficient_answer(answer: str) -> bool:
+    lowered = clean_model_text(answer).lower()
+    markers = (
+        "insufficient evidence",
+        "unable to determine",
+        "cannot determine",
+        "not enough information",
+        "not available",
+        "not found",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def extract_json_array(text: str) -> Optional[List[Any]]:
@@ -285,6 +318,9 @@ class DeepResearchAgent:
         auto_open_top_n: int = 1,
         min_tool_calls: int = 3,
         max_no_new_info_rounds: int = 2,
+        verify_final_answer: bool = True,
+        verification_top_k: int = 5,
+        verification_open_top_n: int = 1,
     ) -> None:
         self.client = client
         self.model = model
@@ -301,6 +337,9 @@ class DeepResearchAgent:
         self.auto_open_top_n = auto_open_top_n
         self.min_tool_calls = min_tool_calls
         self.max_no_new_info_rounds = max_no_new_info_rounds
+        self.verify_final_answer = verify_final_answer
+        self.verification_top_k = verification_top_k
+        self.verification_open_top_n = verification_open_top_n
 
     def answer(self, question: str, query_id: Optional[str] = None) -> Dict[str, Any]:
         state = ResearchState()
@@ -342,6 +381,7 @@ class DeepResearchAgent:
                         continue
                     if not has_exact_answer(final_text) or not is_plausible_short_answer(extract_exact_answer(final_text)):
                         final_text = self._force_final_answer(messages, state)
+                    final_text = self._maybe_verify_final_answer(question, final_text, messages, state)
                     return self._build_record(
                         query_id=query_id,
                         question=question,
@@ -376,6 +416,7 @@ class DeepResearchAgent:
             if stop_reason == "completed":
                 stop_reason = "max_rounds_reached"
             final_text = self._force_final_answer(messages, state)
+            final_text = self._maybe_verify_final_answer(question, final_text, messages, state)
             return self._build_record(
                 query_id=query_id,
                 question=question,
@@ -554,6 +595,97 @@ class DeepResearchAgent:
             }
         )
 
+    def _maybe_verify_final_answer(
+        self,
+        question: str,
+        final_text: str,
+        messages: List[Dict[str, Any]],
+        state: ResearchState,
+    ) -> str:
+        if not self.verify_final_answer:
+            return final_text
+
+        candidate = extract_exact_answer(final_text)
+        if not candidate:
+            return final_text
+
+        verification_queries = self._build_verification_queries(question, candidate, state)
+        for index, query in enumerate(verification_queries, start=1):
+            self._append_verification_search(messages, state, query, call_id=f"verification_search_{index}")
+
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    VERIFIER_PROMPT
+                    + "\n\nOriginal question:\n"
+                    + question
+                    + "\n\nCandidate final answer:\n"
+                    + candidate
+                    + "\n\n"
+                    + state.to_prompt()
+                ),
+            }
+        )
+        response = self.client.simple_chat(
+            model=self.model,
+            messages=self._context_messages(messages, state),
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+        raw_message = response["choices"][0]["message"]
+        assistant_message, _ = normalize_assistant_message(raw_message, "verify")
+        messages.append(assistant_message)
+        verified_text = assistant_message.get("content", "")
+        if has_exact_answer(verified_text):
+            return verified_text
+        return final_text
+
+    def _build_verification_queries(self, question: str, candidate: str, state: ResearchState) -> List[str]:
+        queries: List[str] = []
+        candidate = clean_model_text(candidate)
+        if candidate and not is_insufficient_answer(candidate):
+            self._add_query(queries, candidate)
+
+        for prior_query in state.seen_queries[:3]:
+            if candidate and not is_insufficient_answer(candidate):
+                self._add_query(queries, f"{candidate} {prior_query}")
+            elif prior_query:
+                self._add_query(queries, prior_query)
+            if len(queries) >= 2:
+                break
+
+        if not queries:
+            self._add_query(queries, question)
+        return queries[:2]
+
+    def _append_verification_search(
+        self,
+        messages: List[Dict[str, Any]],
+        state: ResearchState,
+        query: str,
+        call_id: str,
+    ) -> None:
+        tool_call = {
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": "search",
+                "arguments": json_dumps({"query": query, "top_k": self.verification_top_k}),
+            },
+        }
+        messages.append({"role": "assistant", "content": "", "tool_calls": [tool_call]})
+        result = self._execute_tool_call(tool_call)
+        state.remember_tool_result("search", {"query": query, "top_k": self.verification_top_k}, result)
+        self._append_tool_result(messages, tool_call["id"], result)
+
+        old_auto_open_top_n = self.auto_open_top_n
+        try:
+            self.auto_open_top_n = self.verification_open_top_n
+            self._append_auto_open_calls(messages, state, result, prefix=call_id)
+        finally:
+            self.auto_open_top_n = old_auto_open_top_n
+
     def _execute_tool_call(self, tool_call: Dict[str, Any]) -> Any:
         function = tool_call.get("function", {})
         name = function.get("name", "")
@@ -693,6 +825,9 @@ def run_submission(args: argparse.Namespace) -> None:
         auto_open_top_n=args.auto_open_top_n,
         min_tool_calls=args.min_tool_calls,
         max_no_new_info_rounds=args.max_no_new_info_rounds,
+        verify_final_answer=args.verify_final_answer,
+        verification_top_k=args.verification_top_k,
+        verification_open_top_n=args.verification_open_top_n,
     )
 
     output_path = Path(args.output)
@@ -766,6 +901,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=2,
         help="Force final answer after this many rounds without new docs or notes.",
     )
+    parser.add_argument(
+        "--verification-top-k",
+        type=int,
+        default=5,
+        help="Top-k for final candidate answer verification searches.",
+    )
+    parser.add_argument(
+        "--verification-open-top-n",
+        type=int,
+        default=1,
+        help="Automatically open this many top verification search results.",
+    )
+    parser.add_argument(
+        "--no-verify-final-answer",
+        dest="verify_final_answer",
+        action="store_false",
+        help="Disable final candidate answer verification.",
+    )
     parser.add_argument("--resume", action="store_true", help="Append and skip query_ids already present in output.")
     parser.add_argument(
         "--no-bootstrap-search",
@@ -774,6 +927,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable the deterministic first search of the original question.",
     )
     parser.set_defaults(bootstrap_search=True)
+    parser.set_defaults(verify_final_answer=True)
     return parser
 
 

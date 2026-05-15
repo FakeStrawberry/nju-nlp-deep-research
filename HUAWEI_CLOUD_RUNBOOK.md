@@ -110,7 +110,9 @@ python -m agent.deep_research_agent \
   --max-rounds 6 \
   --bootstrap-query-count 4 \
   --auto-open-top-n 1 \
-  --min-tool-calls 3
+  --min-tool-calls 3 \
+  --verification-top-k 5 \
+  --verification-open-top-n 1
 ```
 
 如果用 Pangu，把 `--model qwen_auto` 改成：
@@ -125,24 +127,7 @@ python -m agent.deep_research_agent \
 python -m agent.deep_research_agent \
   --dataset browsecomp_plus_hard50.jsonl \
   --index-path indexes/browsecomp_plus_bm25.sqlite \
-  --output runs/submission.jsonl \
-  --model qwen_auto \
-  --base-url http://127.0.0.1:8000/v1 \
-  --top-k 8 \
-  --max-rounds 6 \
-  --max-tokens 1024 \
-  --bootstrap-query-count 4 \
-  --auto-open-top-n 1 \
-  --min-tool-calls 3
-```
-
-如果运行中断，用下面命令续跑，会跳过已经写入 `runs/submission.jsonl` 的 `query_id`：
-
-```bash
-python -m agent.deep_research_agent \
-  --dataset browsecomp_plus_hard50.jsonl \
-  --index-path indexes/browsecomp_plus_bm25.sqlite \
-  --output runs/submission.jsonl \
+  --output runs/submission_v5.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
   --top-k 8 \
@@ -151,6 +136,27 @@ python -m agent.deep_research_agent \
   --bootstrap-query-count 4 \
   --auto-open-top-n 1 \
   --min-tool-calls 3 \
+  --verification-top-k 5 \
+  --verification-open-top-n 1
+```
+
+如果运行中断，用下面命令续跑，会跳过已经写入 `runs/submission_v5.jsonl` 的 `query_id`：
+
+```bash
+python -m agent.deep_research_agent \
+  --dataset browsecomp_plus_hard50.jsonl \
+  --index-path indexes/browsecomp_plus_bm25.sqlite \
+  --output runs/submission_v5.jsonl \
+  --model qwen_auto \
+  --base-url http://127.0.0.1:8000/v1 \
+  --top-k 8 \
+  --max-rounds 6 \
+  --max-tokens 1024 \
+  --bootstrap-query-count 4 \
+  --auto-open-top-n 1 \
+  --min-tool-calls 3 \
+  --verification-top-k 5 \
+  --verification-open-top-n 1 \
   --resume
 ```
 
@@ -158,11 +164,12 @@ python -m agent.deep_research_agent \
 
 ```bash
 python -m agent.eval \
-  --submission runs/submission.jsonl \
+  --submission runs/submission_v5.jsonl \
   --dataset browsecomp_plus_hard50.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
-  --output runs/eval_results.jsonl
+  --output runs/eval_results_v5.jsonl \
+  --max-tokens 1024
 ```
 
 评估结束后，第一行 summary 里有 `accuracy`。也可以看命令行输出的 `Accuracy`。
