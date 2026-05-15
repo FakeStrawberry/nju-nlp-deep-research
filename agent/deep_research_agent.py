@@ -27,6 +27,7 @@ Workflow:
 3. If evidence is insufficient, reformulate the query and continue.
 4. Avoid repeated searches that return the same documents unless you are checking a specific clue.
 5. Stop when the answer is supported, the search budget is exhausted, or new searches add no new information.
+6. Prefer the best-supported specific answer with low confidence over "Insufficient evidence" when at least one concrete candidate is supported by retrieved evidence.
 
 Final answer format:
 Explanation: <brief evidence-based reasoning>
@@ -39,6 +40,7 @@ Evidence: <docid list or short citations>
 FINALIZER_PROMPT = """Stop searching now.
 Based only on the evidence already collected in the conversation, produce the best final answer.
 If the evidence is insufficient, say so clearly.
+Prefer a best-supported specific answer with low confidence over "Insufficient evidence" when the evidence contains a concrete candidate.
 
 Use exactly this format:
 Explanation: <brief evidence-based reasoning>
@@ -58,6 +60,7 @@ Rules:
 - If the candidate is a ticker, abbreviation, or shorthand, normalize it to the full entity name when the evidence supports that normalization.
 - If another short answer is better supported by the evidence, replace the candidate with that answer.
 - Use "Insufficient evidence" only when no specific answer is supported by the evidence.
+- Prefer a low-confidence specific answer over "Insufficient evidence" when retrieved evidence contains a plausible name, title, organization, number, date, country, or phrase.
 - Keep Exact Answer short: a name, title, organization, number, date, country, or phrase.
 
 Use exactly this format:
@@ -75,6 +78,86 @@ EXACT_ANSWER_RE = re.compile(
     r"(?:Exact Answer|Final Answer|Answer)\s*:\s*(.+?)(?:\n[A-Z][A-Za-z ]{1,30}\s*:|\Z)",
     flags=re.IGNORECASE | re.DOTALL,
 )
+QUERY_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’-]*")
+
+BM25_QUERY_STOPWORDS = {
+    "about",
+    "above",
+    "after",
+    "again",
+    "also",
+    "an",
+    "another",
+    "answer",
+    "around",
+    "author",
+    "based",
+    "became",
+    "because",
+    "before",
+    "being",
+    "between",
+    "certain",
+    "could",
+    "during",
+    "first",
+    "following",
+    "given",
+    "having",
+    "identify",
+    "inclusive",
+    "information",
+    "later",
+    "looking",
+    "mentioned",
+    "name",
+    "other",
+    "particular",
+    "published",
+    "question",
+    "second",
+    "should",
+    "specific",
+    "submitted",
+    "their",
+    "there",
+    "they",
+    "these",
+    "third",
+    "those",
+    "through",
+    "under",
+    "what",
+    "when",
+    "which",
+    "while",
+    "whose",
+    "would",
+    "worked",
+    "written",
+}
+
+ENTITY_CONNECTORS = {
+    "and",
+    "at",
+    "by",
+    "da",
+    "de",
+    "del",
+    "der",
+    "di",
+    "du",
+    "for",
+    "in",
+    "la",
+    "le",
+    "of",
+    "on",
+    "the",
+    "to",
+    "van",
+    "von",
+}
 
 
 def clean_model_text(text: Any) -> str:
@@ -228,6 +311,7 @@ class ResearchState:
     evidence_notes: List[str] = field(default_factory=list)
     tool_call_count: int = 0
     no_new_info_rounds: int = 0
+    adaptive_searches_used: int = 0
 
     def remember_tool_result(self, tool_name: str, args: Dict[str, Any], result: Any) -> bool:
         self.tool_call_count += 1
@@ -296,6 +380,7 @@ class ResearchState:
             "seen_docids": sorted(self.seen_docids),
             "evidence_notes": list(self.evidence_notes),
             "no_new_info_rounds": self.no_new_info_rounds,
+            "adaptive_searches_used": self.adaptive_searches_used,
         }
 
 
@@ -321,6 +406,8 @@ class DeepResearchAgent:
         verify_final_answer: bool = True,
         verification_top_k: int = 5,
         verification_open_top_n: int = 1,
+        adaptive_query_count: int = 1,
+        max_adaptive_searches: int = 2,
     ) -> None:
         self.client = client
         self.model = model
@@ -340,6 +427,8 @@ class DeepResearchAgent:
         self.verify_final_answer = verify_final_answer
         self.verification_top_k = verification_top_k
         self.verification_open_top_n = verification_open_top_n
+        self.adaptive_query_count = adaptive_query_count
+        self.max_adaptive_searches = max_adaptive_searches
 
     def answer(self, question: str, query_id: Optional[str] = None) -> Dict[str, Any]:
         state = ResearchState()
@@ -381,7 +470,23 @@ class DeepResearchAgent:
                         continue
                     if not has_exact_answer(final_text) or not is_plausible_short_answer(extract_exact_answer(final_text)):
                         final_text = self._force_final_answer(messages, state)
+                    if self._should_adapt_before_final(final_text, state):
+                        if self._append_adaptive_searches(
+                            messages,
+                            state,
+                            question,
+                            prefix=f"round{round_id}_pre_final",
+                        ):
+                            continue
                     final_text = self._maybe_verify_final_answer(question, final_text, messages, state)
+                    if self._should_adapt_before_final(final_text, state):
+                        if self._append_adaptive_searches(
+                            messages,
+                            state,
+                            question,
+                            prefix=f"round{round_id}_post_verify",
+                        ):
+                            continue
                     return self._build_record(
                         query_id=query_id,
                         question=question,
@@ -403,7 +508,16 @@ class DeepResearchAgent:
                         round_has_new_info = True
                     self._append_tool_result(messages, tool_call["id"], result)
                     if tool_name == "search":
-                        self._append_auto_open_calls(messages, state, result, prefix=f"round{round_id}")
+                        if self._append_auto_open_calls(messages, state, result, prefix=f"round{round_id}"):
+                            round_has_new_info = True
+
+                if not round_has_new_info:
+                    round_has_new_info = self._append_adaptive_searches(
+                        messages,
+                        state,
+                        question,
+                        prefix=f"round{round_id}_no_info",
+                    )
 
                 if round_has_new_info:
                     state.no_new_info_rounds = 0
@@ -447,10 +561,10 @@ class DeepResearchAgent:
 
     def _build_initial_queries(self, question: str) -> List[str]:
         queries: List[str] = []
+        for query in self._bm25_aware_search_queries(question):
+            self._add_query(queries, query)
         for query in self._llm_search_plan(question):
-            self._add_query(queries, query)
-        for query in self._heuristic_search_queries(question):
-            self._add_query(queries, query)
+            self._add_query(queries, self._compress_bm25_query(query))
         self._add_query(queries, question)
         return queries[: max(1, self.bootstrap_query_count)]
 
@@ -481,48 +595,153 @@ class DeepResearchAgent:
         return [str(item).strip() for item in parsed if isinstance(item, str) and item.strip()]
 
     def _heuristic_search_queries(self, question: str) -> List[str]:
+        return self._bm25_aware_search_queries(question)
+
+    def _bm25_aware_search_queries(self, question: str) -> List[str]:
         queries: List[str] = []
-        quoted = re.findall(r"[\"“”']([^\"“”']{2,80})[\"“”']", question)
-        for phrase in quoted:
+        quoted = self._quoted_phrases(question)
+        entities = self._capitalized_phrases(question)
+        identifiers = self._identifier_terms(question)
+        years = re.findall(r"\b(?:1[5-9]\d{2}|20\d{2})\b", question)
+        rare_terms = self._distinctive_terms(question, max_terms=14)
+
+        for phrase in quoted[:4]:
             self._add_query(queries, phrase)
 
-        sentences = re.split(r"(?<=[.!?])\s+", question)
-        for sentence in sentences:
-            words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", sentence)
-            distinctive = [
-                word.strip("'’")
-                for word in words
-                if len(word.strip("'’")) >= 5 or re.search(r"\d", word)
-            ]
-            if 3 <= len(distinctive) <= 14:
-                self._add_query(queries, " ".join(distinctive[:14]))
+        for identifier in identifiers[:4]:
+            self._add_query(queries, identifier)
 
-        all_words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", question)
-        rareish = []
-        stop = {
-            "which",
-            "where",
-            "their",
-            "there",
-            "about",
-            "would",
-            "could",
-            "should",
-            "first",
-            "second",
-            "between",
-            "author",
-            "published",
-            "question",
-            "answer",
-        }
-        for word in all_words:
-            cleaned = word.strip("'’")
-            if len(cleaned) >= 7 and cleaned.lower() not in stop:
-                rareish.append(cleaned)
-        if rareish:
-            self._add_query(queries, " ".join(rareish[:12]))
+        for entity in entities[:4]:
+            self._add_query(queries, entity)
+
+        if identifiers and rare_terms:
+            self._add_query(queries, " ".join(identifiers[:3] + rare_terms[:6]))
+        if years and rare_terms:
+            self._add_query(queries, " ".join(years[:4] + rare_terms[:8]))
+        if entities and rare_terms:
+            self._add_query(queries, " ".join(entities[:2] + rare_terms[:8]))
+        if rare_terms:
+            self._add_query(queries, " ".join(rare_terms[:10]))
         return queries
+
+    @staticmethod
+    def _quoted_phrases(text: str) -> List[str]:
+        phrases = []
+        for phrase in re.findall(r"[\"“”]([^\"“”]{2,100})[\"“”]", text):
+            phrase = re.sub(r"\s+", " ", phrase).strip(" .;:")
+            if phrase and phrase.lower() not in {p.lower() for p in phrases}:
+                phrases.append(phrase)
+        return phrases
+
+    @staticmethod
+    def _identifier_terms(text: str) -> List[str]:
+        identifiers = []
+        patterns = (
+            r"\b[A-Z]{2,}(?:[-_][A-Z0-9]{2,})+\b",
+            r"\b[A-Z]{2,}\d+[A-Z0-9-]*\b",
+            r"\b[A-Za-z]+-\d+[A-Za-z0-9-]*\b",
+            r"\b\d+[A-Za-z]+[A-Za-z0-9-]*\b",
+        )
+        for pattern in patterns:
+            for match in re.findall(pattern, text):
+                cleaned = match.strip(" .;:")
+                if re.fullmatch(r"\d{3,4}s?", cleaned, flags=re.IGNORECASE):
+                    continue
+                if cleaned and cleaned.lower() not in {item.lower() for item in identifiers}:
+                    identifiers.append(cleaned)
+        return identifiers
+
+    @staticmethod
+    def _capitalized_phrases(text: str) -> List[str]:
+        tokens = QUERY_WORD_RE.findall(text)
+        phrases: List[str] = []
+        i = 0
+        while i < len(tokens):
+            token = tokens[i].strip("'’")
+            lower = token.lower()
+            coded_token = bool(
+                re.search(r"[A-Za-z]", token)
+                and re.search(r"\d", token)
+                and not re.fullmatch(r"\d{3,4}s?", token, flags=re.IGNORECASE)
+            )
+            starts_entity = (
+                len(token) > 1
+                and lower not in BM25_QUERY_STOPWORDS
+                and (token[:1].isupper() or token.isupper() or coded_token)
+            )
+            if not starts_entity:
+                i += 1
+                continue
+
+            phrase = [token]
+            j = i + 1
+            while j < len(tokens) and len(phrase) < 7:
+                nxt = tokens[j].strip("'’")
+                nxt_lower = nxt.lower()
+                if nxt_lower in ENTITY_CONNECTORS:
+                    if j + 1 < len(tokens):
+                        after = tokens[j + 1].strip("'’")
+                        coded_after = bool(
+                            re.search(r"[A-Za-z]", after)
+                            and re.search(r"\d", after)
+                            and not re.fullmatch(r"\d{3,4}s?", after, flags=re.IGNORECASE)
+                        )
+                        if after.lower() in BM25_QUERY_STOPWORDS:
+                            break
+                        if after[:1].isupper() or after.isupper() or coded_after:
+                            phrase.append(nxt)
+                            j += 1
+                            continue
+                    break
+                if nxt_lower in BM25_QUERY_STOPWORDS:
+                    break
+                if len(nxt) > 1 and (
+                    nxt[:1].isupper()
+                    or nxt.isupper()
+                    or (
+                        bool(re.search(r"[A-Za-z]", nxt) and re.search(r"\d", nxt))
+                        and not re.fullmatch(r"\d{3,4}s?", nxt, flags=re.IGNORECASE)
+                    )
+                ):
+                    phrase.append(nxt)
+                    j += 1
+                    continue
+                break
+
+            if len(phrase) >= 2:
+                query = " ".join(phrase).strip(" .;:")
+                if query.lower() not in {existing.lower() for existing in phrases}:
+                    phrases.append(query)
+            i = max(j, i + 1)
+        return phrases
+
+    @staticmethod
+    def _distinctive_terms(text: str, max_terms: int = 12) -> List[str]:
+        terms: List[str] = []
+        for word in QUERY_WORD_RE.findall(text):
+            cleaned = word.strip("'’")
+            if cleaned.endswith(("'s", "’s")):
+                cleaned = cleaned[:-2]
+            lower = cleaned.lower()
+            if not cleaned or lower in BM25_QUERY_STOPWORDS:
+                continue
+            if any(ch.isdigit() for ch in cleaned) or len(cleaned) >= 6:
+                if lower not in {term.lower() for term in terms}:
+                    terms.append(cleaned)
+            if len(terms) >= max_terms:
+                break
+        return terms
+
+    @classmethod
+    def _compress_bm25_query(cls, query: str, max_terms: int = 10) -> str:
+        quoted = cls._quoted_phrases(query)
+        identifiers = cls._identifier_terms(query)
+        rare_terms = cls._distinctive_terms(query, max_terms=max_terms)
+        pieces: List[str] = []
+        for piece in quoted[:2] + identifiers[:3] + rare_terms:
+            if piece.lower() not in {existing.lower() for existing in pieces}:
+                pieces.append(piece)
+        return " ".join(pieces[:max_terms]) if pieces else query
 
     @staticmethod
     def _add_query(queries: List[str], query: str) -> None:
@@ -533,7 +752,7 @@ class DeepResearchAgent:
         if lowered not in {existing.lower() for existing in queries}:
             queries.append(query)
 
-    def _append_search_call(self, messages: List[Dict[str, Any]], state: ResearchState, query: str, call_id: str) -> None:
+    def _append_search_call(self, messages: List[Dict[str, Any]], state: ResearchState, query: str, call_id: str) -> bool:
         tool_call = {
             "id": call_id,
             "type": "function",
@@ -544,9 +763,9 @@ class DeepResearchAgent:
         }
         messages.append({"role": "assistant", "content": "", "tool_calls": [tool_call]})
         result = self._execute_tool_call(tool_call)
-        state.remember_tool_result("search", {"query": query, "top_k": self.top_k}, result)
+        has_new_info = state.remember_tool_result("search", {"query": query, "top_k": self.top_k}, result)
         self._append_tool_result(messages, tool_call["id"], result)
-        self._append_auto_open_calls(messages, state, result, prefix=call_id)
+        return self._append_auto_open_calls(messages, state, result, prefix=call_id) or has_new_info
 
     def _append_auto_open_calls(
         self,
@@ -554,9 +773,9 @@ class DeepResearchAgent:
         state: ResearchState,
         search_result: Any,
         prefix: str,
-    ) -> None:
+    ) -> bool:
         if self.auto_open_top_n <= 0 or not isinstance(search_result, list):
-            return
+            return False
         tool_calls = []
         for item in search_result:
             if len(tool_calls) >= self.auto_open_top_n:
@@ -578,13 +797,71 @@ class DeepResearchAgent:
             state.seen_actions.add(canonical_action(tool_call))
 
         if not tool_calls:
-            return
+            return False
         messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
+        has_new_info = False
         for tool_call in tool_calls:
             result = self._execute_tool_call(tool_call)
             args = parse_json_object(tool_call.get("function", {}).get("arguments", "{}"))
-            state.remember_tool_result("open_doc", args, result)
+            if state.remember_tool_result("open_doc", args, result):
+                has_new_info = True
             self._append_tool_result(messages, tool_call["id"], result)
+        return has_new_info
+
+    def _should_adapt_before_final(self, final_text: str, state: ResearchState) -> bool:
+        if self.adaptive_query_count <= 0 or state.adaptive_searches_used >= self.max_adaptive_searches:
+            return False
+        candidate = extract_exact_answer(final_text)
+        if not has_exact_answer(final_text):
+            return True
+        if not is_plausible_short_answer(candidate):
+            return True
+        return is_insufficient_answer(candidate)
+
+    def _append_adaptive_searches(
+        self,
+        messages: List[Dict[str, Any]],
+        state: ResearchState,
+        question: str,
+        prefix: str,
+    ) -> bool:
+        if self.adaptive_query_count <= 0 or state.adaptive_searches_used >= self.max_adaptive_searches:
+            return False
+
+        queries = self._adaptive_search_queries(question, state)
+        if not queries:
+            return False
+
+        has_new_info = False
+        for index, query in enumerate(queries[: self.adaptive_query_count], start=1):
+            if state.adaptive_searches_used >= self.max_adaptive_searches:
+                break
+            state.adaptive_searches_used += 1
+            if self._append_search_call(
+                messages,
+                state,
+                query=query,
+                call_id=f"{prefix}_adaptive_search_{index}",
+            ):
+                has_new_info = True
+        return has_new_info
+
+    def _adaptive_search_queries(self, question: str, state: ResearchState) -> List[str]:
+        queries: List[str] = []
+        seen = {query.lower() for query in state.seen_queries}
+
+        for query in self._bm25_aware_search_queries(question):
+            if query.lower() not in seen:
+                self._add_query(queries, query)
+
+        for prior_query in reversed(state.seen_queries):
+            compressed = self._compress_bm25_query(prior_query, max_terms=7)
+            if compressed.lower() not in seen:
+                self._add_query(queries, compressed)
+
+        if question.lower() not in seen:
+            self._add_query(queries, question)
+        return queries
 
     def _append_tool_result(self, messages: List[Dict[str, Any]], tool_call_id: str, result: Any) -> None:
         messages.append(
@@ -606,13 +883,19 @@ class DeepResearchAgent:
             return final_text
 
         candidate = extract_exact_answer(final_text)
-        if not candidate:
-            return final_text
+        candidate_is_valid = (
+            has_exact_answer(final_text)
+            and bool(candidate)
+            and is_plausible_short_answer(candidate)
+            and not is_insufficient_answer(candidate)
+        )
+        verification_candidate = candidate if candidate_is_valid else ""
 
-        verification_queries = self._build_verification_queries(question, candidate, state)
+        verification_queries = self._build_verification_queries(question, verification_candidate, state)
         for index, query in enumerate(verification_queries, start=1):
             self._append_verification_search(messages, state, query, call_id=f"verification_search_{index}")
 
+        candidate_for_prompt = verification_candidate or "No valid candidate answer was produced."
         messages.append(
             {
                 "role": "user",
@@ -621,7 +904,7 @@ class DeepResearchAgent:
                     + "\n\nOriginal question:\n"
                     + question
                     + "\n\nCandidate final answer:\n"
-                    + candidate
+                    + candidate_for_prompt
                     + "\n\n"
                     + state.to_prompt()
                 ),
@@ -828,6 +1111,8 @@ def run_submission(args: argparse.Namespace) -> None:
         verify_final_answer=args.verify_final_answer,
         verification_top_k=args.verification_top_k,
         verification_open_top_n=args.verification_open_top_n,
+        adaptive_query_count=args.adaptive_query_count,
+        max_adaptive_searches=args.max_adaptive_searches,
     )
 
     output_path = Path(args.output)
@@ -912,6 +1197,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Automatically open this many top verification search results.",
+    )
+    parser.add_argument(
+        "--adaptive-query-count",
+        type=int,
+        default=1,
+        help="Run this many deterministic fallback searches when the agent stalls or wants to answer with insufficient evidence.",
+    )
+    parser.add_argument(
+        "--max-adaptive-searches",
+        type=int,
+        default=2,
+        help="Maximum deterministic fallback searches per question.",
     )
     parser.add_argument(
         "--no-verify-final-answer",

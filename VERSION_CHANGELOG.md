@@ -1,6 +1,6 @@
 # Deep Research Agent 版本更新日志
 
-本文记录本项目从 baseline 到 v5 的主要改动、设计意图、实验效果与阶段性反思。
+本文记录本项目从 baseline 到 v6 的主要改动、设计意图、实验效果与阶段性反思。
 
 ## 评估口径说明
 
@@ -19,7 +19,8 @@
 | v3 | `runs/submission_v3.jsonl` | 6/50 = 12% | 加强多轮 research loop、上下文状态与自动打开文档 | 提高证据覆盖率与多跳探索能力 |
 | v3 eval-1024 | 同 v3 submission | 10/50 = 20% | 只调整评估 max tokens | 验证自动评估对 judge 输出长度敏感 |
 | v4 | `runs/submission_v4.jsonl` | 9/50 = 18% | query-aware snippet | 让检索结果摘要更贴近当前 query |
-| v5 | `runs/submission_v5.jsonl` | 待评估 | 最终答案验证检索 | 修正缩写、候选答案不稳和证据不足问题 |
+| v5 | `runs/submission_v5.jsonl` | 11/50 = 22% | 最终答案验证检索 | 修正缩写、候选答案不稳和证据不足问题 |
+| v6 | `runs/submission_v6.jsonl` | 待评估 | BM25-aware query planner、自适应补检索、候选验证清洗 | 提高关键证据召回，降低无效候选反查 |
 
 ## v1：端到端 baseline
 
@@ -171,9 +172,61 @@ v5 可能带来的风险：
 - 如果验证检索结果噪声较大，模型可能过度修正原本正确的答案。
 - 如果候选答案本身很差，基于候选的验证 query 也可能继续偏离。
 
+### 实测效果
+
+自动评估：
+
+- 正确：11/50
+- 准确率：22%
+- 平均工具调用：12.0 次/题
+- 平均检索文档：47.94 篇/题
+
+与 v4 对比：
+
+- 自动评估从 9/50 提升到 11/50。
+- 工具调用从 14.82 次/题下降到 12.0 次/题，检索文档从 69.16 篇/题下降到 47.94 篇/题。
+- 新增 2 个自动判正确样本，没有丢失 v4 自动判正确样本。
+
+人工复核观察：
+
+- 其中 1 个新增样本属于真实收益，v5 将候选答案规范成了完整标题。
+- 仍有若干自动 judge 噪声：预测为 `Insufficient evidence` 但被判正确。
+- 在 v5 的 39 个自动判错样本中，只有 6 个样本的标准答案字面出现在轨迹中，说明主要瓶颈仍是关键证据召回，而不是最终答案格式。
+- v5 验证阶段有 9 题改变了候选答案，但部分候选来自不规范模型输出，如 `Wait` 或长段推理文本，这会污染候选反查 query。
+
+### 反思
+
+v5 的方向比继续盲目增加检索次数更成熟。前几版结果说明，单纯扩大检索预算收益递减，后期瓶颈更多在“候选答案是否被证据支持”和“答案形式是否规范”。不过 v5 的实测也说明，最终验证只能解决后处理问题，不能替代更好的 query 规划；如果关键文档没有被召回，验证阶段无法凭空修复。
+
+## v6：BM25-aware query planner 与自适应补检索
+
+### 改动
+
+- 重写初始 query 规划顺序，优先生成更适合当前 SQLite FTS5/BM25 的短 query：
+  - 引号短语 query
+  - 大写实体短语 query
+  - 编号、代码、年份 query
+  - 罕见词 query
+  - LLM query plan 压缩版
+  - 原始问题兜底
+- 新增自适应补检索机制：
+  - 当一轮工具调用没有新文档或新证据时，自动追加少量未尝试过的 deterministic fallback query。
+  - 当模型准备以 `Insufficient evidence` 或不规范答案收尾时，若预算允许，先追加 fallback query 再继续推理。
+- 新增参数：
+  - `--adaptive-query-count`
+  - `--max-adaptive-searches`
+- 清理最终验证候选：
+  - 只有格式正常、短且非 `Insufficient evidence` 的 `Exact Answer` 会用于候选反查。
+  - 如果模型输出残片或长段推理文本，不再把它当作 candidate query。
+- 更新最终回答和验证 prompt，要求在有具体候选证据时优先给出低置信度具体答案，而不是过早输出 `Insufficient evidence`。
+
+### 意图
+
+v6 直接针对 v5 暴露出的主要问题：多数错误不是因为最终答案格式，而是因为关键证据没有被召回。结合当前检索器实现，query 会被拆成去重 token 并通过 `OR` 匹配，因此长 query 里的普通词容易制造噪声。v6 的目标是让 query 更短、更实体化、更适合 BM25 稀疏匹配。
+
 ### 当前效果
 
-截至本文记录时，v5 代码已完成并通过静态检查，但完整 `hard50` 评估尚未运行。因此 v5 的最终效果需要以 `runs/eval_results_v5.jsonl` 为准。
+截至本文记录时，v6 代码已完成并通过静态检查，完整 `hard50` 评估尚未运行。因此 v6 的最终效果需要以 `runs/eval_results_v6.jsonl` 为准。
 
 推荐运行：
 
@@ -181,34 +234,36 @@ v5 可能带来的风险：
 python -m agent.deep_research_agent \
   --dataset browsecomp_plus_hard50.jsonl \
   --index-path indexes/browsecomp_plus_bm25.sqlite \
-  --output runs/submission_v5.jsonl \
+  --output runs/submission_v6.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
   --top-k 8 \
   --max-rounds 6 \
   --max-tokens 1024 \
-  --bootstrap-query-count 4 \
+  --bootstrap-query-count 5 \
   --auto-open-top-n 1 \
   --min-tool-calls 3 \
   --verification-top-k 5 \
-  --verification-open-top-n 1
+  --verification-open-top-n 1 \
+  --adaptive-query-count 1 \
+  --max-adaptive-searches 2
 ```
 
 评估：
 
 ```bash
 python -m agent.eval \
-  --submission runs/submission_v5.jsonl \
+  --submission runs/submission_v6.jsonl \
   --dataset browsecomp_plus_hard50.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
-  --output runs/eval_results_v5.jsonl \
+  --output runs/eval_results_v6.jsonl \
   --max-tokens 1024
 ```
 
 ### 反思
 
-v5 的方向比继续盲目增加检索次数更成熟。前几版结果说明，单纯扩大检索预算收益递减，后期瓶颈更多在“候选答案是否被证据支持”和“答案形式是否规范”。最终验证阶段正是为了处理这个瓶颈。
+v6 没有替换检索器，也没有引入外部知识；它只改变 query 生成和停滞处理策略。风险是短 query 可能过度放宽，带来更多同名实体干扰，因此需要通过 v6 评估继续观察：如果召回提升但错误实体增多，下一步应加入证据级 rerank 或答案类型约束。
 
 ## 阶段性总体反思
 
@@ -217,8 +272,9 @@ v5 的方向比继续盲目增加检索次数更成熟。前几版结果说明�
 3. snippet 质量很关键。v4 的 query-aware snippet 证明，在不改变 BM25 的前提下，仅改善文档片段呈现就能提升模型可用证据。
 4. 自动评估只能作为参考。v3 eval-1024 和 v4 都显示 judge 会产生误判，因此需要结合人工复核分析。
 5. 后续优化应优先做通用机制，不应针对 hard50 的标准答案或具体题目做规则。
+6. v5 到 v6 的分析表明，关键证据召回仍是主瓶颈，最终答案验证只能作为后处理。
 
-## v6 可继续尝试的方向
+## v7 可继续尝试的方向
 
 ### 方向一：证据级 rerank
 
@@ -236,7 +292,7 @@ v5 的方向比继续盲目增加检索次数更成熟。前几版结果说明�
 
 ### 方向四：失败状态触发补检索
 
-当最终答案没有出现在任何 opened doc、证据引用为空、或候选答案只在 snippet 中弱出现时，自动触发一轮补检索。这个机制可以只看当前轨迹，不需要标准答案。
+v6 已经实现轻量级停滞补检索。后续可以继续细化触发条件：当最终答案没有出现在任何 opened doc、证据引用为空、或候选答案只在 snippet 中弱出现时，自动触发更有针对性的补检索。这个机制可以只看当前轨迹，不需要标准答案。
 
 ### 方向五：评估稳定性改进
 

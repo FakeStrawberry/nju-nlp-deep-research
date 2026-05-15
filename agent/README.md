@@ -67,6 +67,8 @@ python -m agent.build_bm25_index \
 - 用 `search` / `open_doc` / `find_in_doc` 执行本地检索与文档检查
 - 让模型在多轮 loop 中决定是否继续搜索或最终回答
 - 用最大轮数与“无新信息”作为停止条件
+- 用 BM25-aware query 规划和停滞后的自适应补检索提高召回
+- 在最终提交前验证候选答案并清理不规范候选
 - 保留完整 `messages` 轨迹，并额外记录 `state_summary`
 - 直接写出评测脚本可读取的 JSONL
 
@@ -76,16 +78,18 @@ python -m agent.build_bm25_index \
 python -m agent.deep_research_agent \
   --dataset browsecomp_plus_hard50.jsonl \
   --index-path indexes/browsecomp_plus_bm25.sqlite \
-  --output runs/submission_v5.jsonl \
+  --output runs/submission_v6.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
   --top-k 8 \
   --max-rounds 6 \
-  --bootstrap-query-count 4 \
+  --bootstrap-query-count 5 \
   --auto-open-top-n 1 \
   --min-tool-calls 3 \
   --verification-top-k 5 \
-  --verification-open-top-n 1
+  --verification-open-top-n 1 \
+  --adaptive-query-count 1 \
+  --max-adaptive-searches 2
 ```
 
 调试时可以先只跑 3 条：

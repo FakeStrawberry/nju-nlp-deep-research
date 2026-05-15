@@ -140,6 +140,7 @@ http://127.0.0.1:8000/v1
   - 支持多轮工具调用 loop
   - 支持最大轮数、无新信息停止、强制最终回答
   - 支持上下文压缩：保留完整提交轨迹，同时给模型侧传入紧凑状态摘要
+  - 支持 BM25-aware 初始 query 规划、停滞后的自适应补检索、最终答案验证
   - 直接导出符合要求的 `submission.jsonl`
 
 在已经启动 vLLM、并已经构建 BM25 索引后，可以运行：
@@ -150,16 +151,18 @@ http://127.0.0.1:8000/v1
 python -m agent.deep_research_agent \
   --dataset browsecomp_plus_hard50.jsonl \
   --index-path indexes/browsecomp_plus_bm25.sqlite \
-  --output runs/submission_v5.jsonl \
+  --output runs/submission_v6.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
   --top-k 8 \
   --max-rounds 6 \
-  --bootstrap-query-count 4 \
+  --bootstrap-query-count 5 \
   --auto-open-top-n 1 \
   --min-tool-calls 3 \
   --verification-top-k 5 \
-  --verification-open-top-n 1
+  --verification-open-top-n 1 \
+  --adaptive-query-count 1 \
+  --max-adaptive-searches 2
 ```
 
 如果中途中断，可以用 `--resume` 继续写同一个输出文件：
@@ -168,16 +171,18 @@ python -m agent.deep_research_agent \
 python -m agent.deep_research_agent \
   --dataset browsecomp_plus_hard50.jsonl \
   --index-path indexes/browsecomp_plus_bm25.sqlite \
-  --output runs/submission_v5.jsonl \
+  --output runs/submission_v6.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
   --top-k 8 \
   --max-rounds 6 \
-  --bootstrap-query-count 4 \
+  --bootstrap-query-count 5 \
   --auto-open-top-n 1 \
   --min-tool-calls 3 \
   --verification-top-k 5 \
   --verification-open-top-n 1 \
+  --adaptive-query-count 1 \
+  --max-adaptive-searches 2 \
   --resume
 ```
 
@@ -217,11 +222,12 @@ python -m agent.deep_research_agent \
 
 ```bash
 python -m agent.eval \
-  --submission runs/submission.jsonl \
+  --submission runs/submission_v6.jsonl \
   --dataset browsecomp_plus_hard50.jsonl \
-  --model Qwen3-8B \
+  --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
-  --output runs/eval_results.jsonl
+  --output runs/eval_results_v6.jsonl \
+  --max-tokens 1024
 ```
 
 你也可以在 notebook 中直接调用 `run_evaluation()` 函数进行评估。
