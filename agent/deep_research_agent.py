@@ -50,14 +50,15 @@ Evidence: <docid list or short citations>
 """
 
 
-VERIFIER_PROMPT = """Verify the candidate final answer before submission.
+VERIFIER_PROMPT = """Choose the final answer before submission.
 
 Use only the existing conversation evidence and the verification search results just added.
 Do not use outside knowledge and do not invent missing evidence.
 
 Rules:
-- If the candidate is directly supported, keep it.
-- If the candidate is a ticker, abbreviation, or shorthand, normalize it to the full entity name when the evidence supports that normalization.
+- Compare the observed candidate answers against the evidence.
+- If a candidate is directly supported, keep it.
+- If a candidate is a ticker, abbreviation, or shorthand, normalize it to the full entity name when the evidence supports that normalization.
 - If another short answer is better supported by the evidence, replace the candidate with that answer.
 - Use "Insufficient evidence" only when no specific answer is supported by the evidence.
 - Prefer a low-confidence specific answer over "Insufficient evidence" when retrieved evidence contains a plausible name, title, organization, number, date, country, or phrase.
@@ -87,6 +88,7 @@ BM25_QUERY_STOPWORDS = {
     "again",
     "also",
     "an",
+    "as",
     "another",
     "answer",
     "around",
@@ -99,6 +101,7 @@ BM25_QUERY_STOPWORDS = {
     "between",
     "certain",
     "could",
+    "can",
     "during",
     "first",
     "following",
@@ -135,6 +138,38 @@ BM25_QUERY_STOPWORDS = {
     "would",
     "worked",
     "written",
+}
+
+GENERIC_QUERY_TERMS = {
+    "academic",
+    "annual",
+    "article",
+    "building",
+    "city",
+    "company",
+    "country",
+    "department",
+    "dissertation",
+    "english",
+    "europe",
+    "figure",
+    "health",
+    "individual",
+    "journal",
+    "magazine",
+    "museum",
+    "person",
+    "press",
+    "professor",
+    "report",
+    "research",
+    "review",
+    "school",
+    "society",
+    "student",
+    "university",
+    "work",
+    "writer",
 }
 
 ENTITY_CONNECTORS = {
@@ -407,7 +442,7 @@ class DeepResearchAgent:
         verification_top_k: int = 5,
         verification_open_top_n: int = 1,
         adaptive_query_count: int = 1,
-        max_adaptive_searches: int = 2,
+        max_adaptive_searches: int = 1,
     ) -> None:
         self.client = client
         self.model = model
@@ -561,10 +596,11 @@ class DeepResearchAgent:
 
     def _build_initial_queries(self, question: str) -> List[str]:
         queries: List[str] = []
-        for query in self._bm25_aware_search_queries(question):
-            self._add_query(queries, query)
         for query in self._llm_search_plan(question):
-            self._add_query(queries, self._compress_bm25_query(query))
+            self._add_query(queries, query)
+        for query in self._bm25_aware_search_queries(question):
+            if self._is_high_quality_fallback_query(query):
+                self._add_query(queries, query)
         self._add_query(queries, question)
         return queries[: max(1, self.bootstrap_query_count)]
 
@@ -709,6 +745,9 @@ class DeepResearchAgent:
                 break
 
             if len(phrase) >= 2:
+                while phrase and phrase[-1].lower() in ENTITY_CONNECTORS:
+                    phrase.pop()
+            if len(phrase) >= 2:
                 query = " ".join(phrase).strip(" .;:")
                 if query.lower() not in {existing.lower() for existing in phrases}:
                     phrases.append(query)
@@ -742,6 +781,64 @@ class DeepResearchAgent:
             if piece.lower() not in {existing.lower() for existing in pieces}:
                 pieces.append(piece)
         return " ".join(pieces[:max_terms]) if pieces else query
+
+    @staticmethod
+    def _query_tokens(query: str) -> List[str]:
+        tokens = []
+        for token in QUERY_WORD_RE.findall(clean_model_text(query)):
+            cleaned = token.strip("'’")
+            if cleaned.endswith(("'s", "’s")):
+                cleaned = cleaned[:-2]
+            if cleaned:
+                tokens.append(cleaned)
+        return tokens
+
+    @classmethod
+    def _is_high_quality_fallback_query(cls, query: str) -> bool:
+        cleaned = clean_model_text(query)
+        if not cleaned or len(cleaned) > 180:
+            return False
+
+        identifiers = cls._identifier_terms(cleaned)
+        if identifiers:
+            return True
+
+        tokens = cls._query_tokens(cleaned)
+        useful = [
+            token
+            for token in tokens
+            if token.lower() not in BM25_QUERY_STOPWORDS and token.lower() not in ENTITY_CONNECTORS
+        ]
+        if len(useful) < 2:
+            return False
+
+        lowered = [token.lower() for token in useful]
+        if len(useful) <= 2 and all(token in GENERIC_QUERY_TERMS or len(token) <= 3 for token in lowered):
+            return False
+
+        has_year = any(re.fullmatch(r"(?:1[5-9]\d{2}|20\d{2})s?", token, flags=re.IGNORECASE) for token in useful)
+        distinctive = [
+            token
+            for token in useful
+            if any(ch.isdigit() for ch in token)
+            or len(token) >= 6
+            or token[:1].isupper()
+            or token.isupper()
+        ]
+        non_generic_distinctive = [
+            token
+            for token in distinctive
+            if token.lower() not in GENERIC_QUERY_TERMS
+            and not re.fullmatch(r"(?:1[5-9]\d{2}|20\d{2})s?", token, flags=re.IGNORECASE)
+        ]
+
+        if has_year and len(non_generic_distinctive) >= 1 and len(useful) >= 3:
+            return True
+        if len(non_generic_distinctive) >= 2:
+            return True
+        if len(distinctive) >= 4 and len(useful) >= 5 and len(non_generic_distinctive) >= 1:
+            return True
+        return False
 
     @staticmethod
     def _add_query(queries: List[str], query: str) -> None:
@@ -851,12 +948,12 @@ class DeepResearchAgent:
         seen = {query.lower() for query in state.seen_queries}
 
         for query in self._bm25_aware_search_queries(question):
-            if query.lower() not in seen:
+            if query.lower() not in seen and self._is_high_quality_fallback_query(query):
                 self._add_query(queries, query)
 
         for prior_query in reversed(state.seen_queries):
             compressed = self._compress_bm25_query(prior_query, max_terms=7)
-            if compressed.lower() not in seen:
+            if compressed.lower() not in seen and self._is_high_quality_fallback_query(compressed):
                 self._add_query(queries, compressed)
 
         if question.lower() not in seen:
@@ -882,20 +979,14 @@ class DeepResearchAgent:
         if not self.verify_final_answer:
             return final_text
 
-        candidate = extract_exact_answer(final_text)
-        candidate_is_valid = (
-            has_exact_answer(final_text)
-            and bool(candidate)
-            and is_plausible_short_answer(candidate)
-            and not is_insufficient_answer(candidate)
-        )
-        verification_candidate = candidate if candidate_is_valid else ""
+        candidates = self._collect_candidate_answers(final_text, messages)
+        verification_candidate = candidates[0] if candidates else ""
 
         verification_queries = self._build_verification_queries(question, verification_candidate, state)
         for index, query in enumerate(verification_queries, start=1):
             self._append_verification_search(messages, state, query, call_id=f"verification_search_{index}")
 
-        candidate_for_prompt = verification_candidate or "No valid candidate answer was produced."
+        candidate_block = "\n".join(f"- {candidate}" for candidate in candidates[:5]) or "(none)"
         messages.append(
             {
                 "role": "user",
@@ -903,8 +994,8 @@ class DeepResearchAgent:
                     VERIFIER_PROMPT
                     + "\n\nOriginal question:\n"
                     + question
-                    + "\n\nCandidate final answer:\n"
-                    + candidate_for_prompt
+                    + "\n\nObserved candidate answers:\n"
+                    + candidate_block
                     + "\n\n"
                     + state.to_prompt()
                 ),
@@ -920,9 +1011,65 @@ class DeepResearchAgent:
         assistant_message, _ = normalize_assistant_message(raw_message, "verify")
         messages.append(assistant_message)
         verified_text = assistant_message.get("content", "")
+        if not has_exact_answer(verified_text):
+            return final_text
+
+        verified_answer = extract_exact_answer(verified_text)
+        if not is_plausible_short_answer(verified_answer):
+            return final_text
+        if candidates and is_insufficient_answer(verified_answer):
+            return final_text
+        if candidates and not self._answer_supported_by_state(verified_answer, state):
+            first_candidate = candidates[0]
+            if self._answer_supported_by_state(first_candidate, state):
+                return final_text
         if has_exact_answer(verified_text):
             return verified_text
         return final_text
+
+    def _collect_candidate_answers(self, final_text: str, messages: List[Dict[str, Any]]) -> List[str]:
+        candidates: List[str] = []
+
+        def add_candidate(answer: str) -> None:
+            answer = clean_model_text(answer)
+            if not answer or is_insufficient_answer(answer) or not is_plausible_short_answer(answer):
+                return
+            if answer.lower() not in {candidate.lower() for candidate in candidates}:
+                candidates.append(answer)
+
+        if has_exact_answer(final_text):
+            add_candidate(extract_exact_answer(final_text))
+
+        for message in reversed(messages):
+            if message.get("role") != "assistant":
+                continue
+            content = clean_model_text(message.get("content", ""))
+            if has_exact_answer(content):
+                add_candidate(extract_exact_answer(content))
+            if len(candidates) >= 5:
+                break
+        return candidates[:5]
+
+    @staticmethod
+    def _answer_supported_by_state(answer: str, state: ResearchState) -> bool:
+        answer = clean_model_text(answer).lower()
+        if not answer or is_insufficient_answer(answer):
+            return False
+        evidence_text = "\n".join(state.evidence_notes).lower()
+        if not evidence_text:
+            return False
+        if answer in evidence_text:
+            return True
+        terms = [
+            token
+            for token in QUERY_WORD_RE.findall(answer)
+            if len(token) >= 3 and token.lower() not in BM25_QUERY_STOPWORDS and token.lower() not in ENTITY_CONNECTORS
+        ]
+        if not terms:
+            return False
+        hits = sum(1 for term in terms if term.lower() in evidence_text)
+        required = min(len(terms), 2)
+        return hits >= required
 
     def _build_verification_queries(self, question: str, candidate: str, state: ResearchState) -> List[str]:
         queries: List[str] = []
@@ -1207,7 +1354,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-adaptive-searches",
         type=int,
-        default=2,
+        default=1,
         help="Maximum deterministic fallback searches per question.",
     )
     parser.add_argument(

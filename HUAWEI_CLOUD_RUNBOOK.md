@@ -114,7 +114,7 @@ python -m agent.deep_research_agent \
   --verification-top-k 5 \
   --verification-open-top-n 1 \
   --adaptive-query-count 1 \
-  --max-adaptive-searches 2
+  --max-adaptive-searches 1
 ```
 
 如果用 Pangu，把 `--model qwen_auto` 改成：
@@ -129,7 +129,7 @@ python -m agent.deep_research_agent \
 python -m agent.deep_research_agent \
   --dataset browsecomp_plus_hard50.jsonl \
   --index-path indexes/browsecomp_plus_bm25.sqlite \
-  --output runs/submission_v6.jsonl \
+  --output runs/submission_v7.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
   --top-k 8 \
@@ -141,16 +141,16 @@ python -m agent.deep_research_agent \
   --verification-top-k 5 \
   --verification-open-top-n 1 \
   --adaptive-query-count 1 \
-  --max-adaptive-searches 2
+  --max-adaptive-searches 1
 ```
 
-如果运行中断，用下面命令续跑，会跳过已经写入 `runs/submission_v6.jsonl` 的 `query_id`：
+如果运行中断，用下面命令续跑，会跳过已经写入 `runs/submission_v7.jsonl` 的 `query_id`：
 
 ```bash
 python -m agent.deep_research_agent \
   --dataset browsecomp_plus_hard50.jsonl \
   --index-path indexes/browsecomp_plus_bm25.sqlite \
-  --output runs/submission_v6.jsonl \
+  --output runs/submission_v7.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
   --top-k 8 \
@@ -162,7 +162,7 @@ python -m agent.deep_research_agent \
   --verification-top-k 5 \
   --verification-open-top-n 1 \
   --adaptive-query-count 1 \
-  --max-adaptive-searches 2 \
+  --max-adaptive-searches 1 \
   --resume
 ```
 
@@ -170,11 +170,11 @@ python -m agent.deep_research_agent \
 
 ```bash
 python -m agent.eval \
-  --submission runs/submission_v6.jsonl \
+  --submission runs/submission_v7.jsonl \
   --dataset browsecomp_plus_hard50.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
-  --output runs/eval_results_v6.jsonl \
+  --output runs/eval_results_v7.jsonl \
   --max-tokens 1024
 ```
 
@@ -197,7 +197,7 @@ python -m agent.eval \
 
 其中：
 
-- `runs/submission_v6.jsonl` 改名为 `学号-姓名-submission-最终得分.jsonl`
+- `runs/submission_v7.jsonl` 改名为 `学号-姓名-submission-最终得分.jsonl`
 - 小数点用下划线，例如 `10.5` 写成 `10_5`
 - `eval.txt` 可以保存评估命令的终端输出和 summary
 - 不做 Open Track 时，目录名不要带 `-opentrack`

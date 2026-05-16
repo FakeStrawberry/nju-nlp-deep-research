@@ -1,6 +1,6 @@
 # Deep Research Agent 版本更新日志
 
-本文记录本项目从 baseline 到 v6 的主要改动、设计意图、实验效果与阶段性反思。
+本文记录本项目从 baseline 到 v7 的主要改动、设计意图、实验效果与阶段性反思。
 
 ## 评估口径说明
 
@@ -20,7 +20,8 @@
 | v3 eval-1024 | 同 v3 submission | 10/50 = 20% | 只调整评估 max tokens | 验证自动评估对 judge 输出长度敏感 |
 | v4 | `runs/submission_v4.jsonl` | 9/50 = 18% | query-aware snippet | 让检索结果摘要更贴近当前 query |
 | v5 | `runs/submission_v5.jsonl` | 11/50 = 22% | 最终答案验证检索 | 修正缩写、候选答案不稳和证据不足问题 |
-| v6 | `runs/submission_v6.jsonl` | 待评估 | BM25-aware query planner、自适应补检索、候选验证清洗 | 提高关键证据召回，降低无效候选反查 |
+| v6 | `runs/submission_v6.jsonl` | 8/50 = 16% | BM25-aware query planner、自适应补检索、候选验证清洗 | 提高关键证据召回，降低无效候选反查 |
+| v7 | `runs/submission_v7.jsonl` | 待评估 | LLM-first query、gated fallback、候选仲裁 | 保留 v5 稳定性，吸收 v6 的受控召回收益 |
 
 ## v1：端到端 baseline
 
@@ -224,9 +225,59 @@ v5 的方向比继续盲目增加检索次数更成熟。前几版结果说明�
 
 v6 直接针对 v5 暴露出的主要问题：多数错误不是因为最终答案格式，而是因为关键证据没有被召回。结合当前检索器实现，query 会被拆成去重 token 并通过 `OR` 匹配，因此长 query 里的普通词容易制造噪声。v6 的目标是让 query 更短、更实体化、更适合 BM25 稀疏匹配。
 
+### 实测效果
+
+自动评估：
+
+- 正确：8/50
+- 准确率：16%
+- 平均工具调用：13.44 次/题
+- 平均检索文档：54.3 篇/题
+
+与 v5 对比：
+
+- 自动评估从 11/50 下降到 8/50。
+- 工具调用从 12.0 次/题上升到 13.44 次/题，检索文档从 47.94 篇/题上升到 54.3 篇/题。
+- v6 新增 5 个自动判正确样本，但丢失 8 个 v5 自动判正确样本。
+- v5 与 v6 同时正确的样本只有 3 个，说明两版存在互补性，但 v6 的选择机制不稳定。
+
+人工复核观察：
+
+- v6 的 BM25-aware query planner 能找到一些 v5 没找到的关键线索，说明 query 层优化方向有价值。
+- 但 deterministic 短 query 太靠前，容易引入同名实体和宽泛噪声，例如半截实体、过泛机构名或年月类 query。
+- adaptive search 默认最多 2 次，带来了更多文档，但没有稳定提升最终答案。
+- verifier 在没有有效候选时仍可能输出 `Insufficient evidence` 或格式残片。
+
+### 反思
+
+v6 没有替换检索器，也没有引入外部知识；它只改变 query 生成和停滞处理策略。实测表明，query 层优化不能只追求更广召回，还必须控制 query 质量和进入上下文的证据噪声。v7 因此应回到 v5 的稳定主线，同时把 v6 的 deterministic query 收缩为受控补充。
+
+## v7：LLM-first query 与候选仲裁
+
+### 改动
+
+- 恢复 LLM-first bootstrap：
+  - 初始检索重新优先使用模型规划出的 query。
+  - BM25-aware deterministic query 不再抢占第一批主搜索，只在通过质量门控后作为补充。
+- 加入 deterministic query 质量门控：
+  - 过滤半截实体、单词 query、泛机构 query、纯年份/泛词 query。
+  - 保留明确编号、代码、标题、人名、机构全称和含稀有词的组合 query。
+- 收缩 adaptive search：
+  - 默认 `--max-adaptive-searches` 从 2 降到 1。
+  - fallback query 必须通过质量门控。
+- 将最终验证改为候选仲裁：
+  - 从主回答和历史 assistant 消息中收集格式正常的候选答案。
+  - verifier 接收候选列表，而不是单个伪候选。
+  - 如果已有具体候选，verifier 不能轻易用 `Insufficient evidence` 覆盖它。
+  - 若 verifier 输出的具体答案没有被证据摘要支持，而原候选有证据支持，则保留原候选。
+
+### 意图
+
+v7 的目标不是继续增加搜索量，而是降低 v6 的噪声副作用。它保留 v6 对 BM25 query 特性的利用，但把 deterministic query 放到更保守的位置；同时把 v5 的最终验证升级成候选仲裁，减少单一候选错误或无效候选导致的后处理退化。
+
 ### 当前效果
 
-截至本文记录时，v6 代码已完成并通过静态检查，完整 `hard50` 评估尚未运行。因此 v6 的最终效果需要以 `runs/eval_results_v6.jsonl` 为准。
+截至本文记录时，v7 代码已完成并通过静态检查，完整 `hard50` 评估尚未运行。因此 v7 的最终效果需要以 `runs/eval_results_v7.jsonl` 为准。
 
 推荐运行：
 
@@ -234,7 +285,7 @@ v6 直接针对 v5 暴露出的主要问题：多数错误不是因为最终答�
 python -m agent.deep_research_agent \
   --dataset browsecomp_plus_hard50.jsonl \
   --index-path indexes/browsecomp_plus_bm25.sqlite \
-  --output runs/submission_v6.jsonl \
+  --output runs/submission_v7.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
   --top-k 8 \
@@ -246,24 +297,24 @@ python -m agent.deep_research_agent \
   --verification-top-k 5 \
   --verification-open-top-n 1 \
   --adaptive-query-count 1 \
-  --max-adaptive-searches 2
+  --max-adaptive-searches 1
 ```
 
 评估：
 
 ```bash
 python -m agent.eval \
-  --submission runs/submission_v6.jsonl \
+  --submission runs/submission_v7.jsonl \
   --dataset browsecomp_plus_hard50.jsonl \
   --model qwen_auto \
   --base-url http://127.0.0.1:8000/v1 \
-  --output runs/eval_results_v6.jsonl \
+  --output runs/eval_results_v7.jsonl \
   --max-tokens 1024
 ```
 
 ### 反思
 
-v6 没有替换检索器，也没有引入外部知识；它只改变 query 生成和停滞处理策略。风险是短 query 可能过度放宽，带来更多同名实体干扰，因此需要通过 v6 评估继续观察：如果召回提升但错误实体增多，下一步应加入证据级 rerank 或答案类型约束。
+v7 是一次收缩型改动：不扩大预算，而是控制 query 质量和最终答案替换条件。如果 v7 能恢复 v5 的稳定正确样本，同时保留部分 v6 新增命中，说明“LLM-first + gated fallback”比“deterministic-first”更适合当前 BM25 工具。
 
 ## 阶段性总体反思
 
@@ -272,9 +323,9 @@ v6 没有替换检索器，也没有引入外部知识；它只改变 query 生�
 3. snippet 质量很关键。v4 的 query-aware snippet 证明，在不改变 BM25 的前提下，仅改善文档片段呈现就能提升模型可用证据。
 4. 自动评估只能作为参考。v3 eval-1024 和 v4 都显示 judge 会产生误判，因此需要结合人工复核分析。
 5. 后续优化应优先做通用机制，不应针对 hard50 的标准答案或具体题目做规则。
-6. v5 到 v6 的分析表明，关键证据召回仍是主瓶颈，最终答案验证只能作为后处理。
+6. v5 到 v6 的分析表明，关键证据召回仍是主瓶颈，但召回必须受质量门控约束。
 
-## v7 可继续尝试的方向
+## v8 可继续尝试的方向
 
 ### 方向一：证据级 rerank
 
@@ -292,7 +343,7 @@ v6 没有替换检索器，也没有引入外部知识；它只改变 query 生�
 
 ### 方向四：失败状态触发补检索
 
-v6 已经实现轻量级停滞补检索。后续可以继续细化触发条件：当最终答案没有出现在任何 opened doc、证据引用为空、或候选答案只在 snippet 中弱出现时，自动触发更有针对性的补检索。这个机制可以只看当前轨迹，不需要标准答案。
+v6/v7 已经实现轻量级停滞补检索。后续可以继续细化触发条件：当最终答案没有出现在任何 opened doc、证据引用为空、或候选答案只在 snippet 中弱出现时，自动触发更有针对性的补检索。这个机制可以只看当前轨迹，不需要标准答案。
 
 ### 方向五：评估稳定性改进
 
